@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .config import ClockAlignmentConfig
-from .types import ClockModelState
+from .types import ClockModelState, ClockObservation
 
 
 class AffineClockModel:
@@ -21,16 +21,39 @@ class AffineClockModel:
         self.config = config or ClockAlignmentConfig()
 
         self.state = ClockModelState.UNOBSERVED
-        self.observation_count = 0
+        self._observations: list[ClockObservation] = []
 
+        # preserverd for previous tests
         self._anchor_source_time: int | float | None = None
         self._anchor_reference_time_ns: int | None = None
 
         self._estimated_scale_ns_per_source_unit: float | None = None
 
+        self._fit_source_anchor: int | float | None = None
+        self._fit_reference_anchor_ns: int | None = None
+        self._fit_reference_offset_ns: float | None = None
+
+    @property
+    def observation_count(self) -> int:
+        return len(self._observations)
+
     @property
     def mapping_available(self) -> bool:
         """Return whether the model can currently map source timestamps."""
+        learned_mapping_available = (
+            self.state in {
+                ClockModelState.ALIGNED,
+                ClockModelState.TRACKING,
+            }
+            and self._fit_source_anchor is not None
+            and self._fit_reference_anchor_ns is not None
+            and self._fit_reference_offset_ns is not None
+            and self._estimated_scale_ns_per_source_unit is not None
+        )
+ 
+        if learned_mapping_available:
+            return True
+ 
         return (
             self._anchor_source_time is not None
             and self._anchor_reference_time_ns is not None
@@ -49,7 +72,12 @@ class AffineClockModel:
     ) -> None:
         """Add one observed correspondence between the two clocks."""
 
-        self.observation_count += 1
+        observation = ClockObservation(
+            source_time=source_time,
+            reference_time_ns=reference_time_ns
+        )
+
+        self._observations.append(observation)
 
         if self.observation_count == 1:
             self._anchor_source_time = source_time
@@ -57,37 +85,137 @@ class AffineClockModel:
             self.state = ClockModelState.ANCHORED
             return
 
-        if self.observation_count == 2:
-            assert self._anchor_source_time is not None
-            assert self._anchor_reference_time_ns is not None
-
-            source_delta = source_time - self._anchor_source_time
-            reference_delta_ns = (
-                reference_time_ns - self._anchor_reference_time_ns
-            )
-
-            if source_delta == 0:
-                return
-
-            self._estimated_scale_ns_per_source_unit = (
-                reference_delta_ns / source_delta
-            )
-
+        # This increment only defines calibration. Once ALIGNED, further
+        # observations are retained but do not yet alter the accepted model.
+        # TRACKING will be introduced by a later test-driven change.
+        if self.state is ClockModelState.ALIGNED:
+            return
+ 
+        scale, _ = self._calculate_affine_fit()
+ 
+        if scale is not None:
+            self._estimated_scale_ns_per_source_unit = scale
             self.state = ClockModelState.RATE_ESTIMATING
+ 
+        if self._ready_to_align():
+            self._accept_learned_mapping()
+
 
     def map(self, source_time: int | float) -> int | None:
         """Map a source timestamp onto the reference clock."""
-
+ 
         if not self.mapping_available:
             return None
-
+ 
+        if (
+            self.state in {
+                ClockModelState.ALIGNED,
+                ClockModelState.TRACKING,
+            }
+            and self._fit_source_anchor is not None
+            and self._fit_reference_anchor_ns is not None
+            and self._fit_reference_offset_ns is not None
+            and self._estimated_scale_ns_per_source_unit is not None
+        ):
+            source_delta = source_time - self._fit_source_anchor
+            mapped_delta_ns = (
+                self._fit_reference_offset_ns
+                + source_delta * self._estimated_scale_ns_per_source_unit
+            )
+            return self._fit_reference_anchor_ns + round(mapped_delta_ns)
+ 
         assert self._anchor_source_time is not None
         assert self._anchor_reference_time_ns is not None
         assert self.config.nominal_scale_ns_per_source_unit is not None
-
+ 
         source_delta = source_time - self._anchor_source_time
-
+ 
         return round(
             self._anchor_reference_time_ns
             + source_delta * self.config.nominal_scale_ns_per_source_unit
         )
+
+    def _ready_to_align(self) -> bool:
+        """Return whether enough calibration evidence has been observed."""
+
+        # is there enough observations compared to the config? 
+        if self.observation_count < self.config.min_learned_observations:
+            return False
+ 
+        first_reference_ns = self._observations[0].reference_time_ns
+        latest_reference_ns = self._observations[-1].reference_time_ns
+        reference_span_ns = latest_reference_ns - first_reference_ns
+
+        # is the elapsed time beteween the first observation and lastest one long enough?
+        return reference_span_ns >= self.config.target_calibration_span_ns
+ 
+    def _accept_learned_mapping(self) -> None:
+        """Promote the current affine estimate to an applied mapping."""
+ 
+        scale, offset_ns = self._calculate_affine_fit()
+ 
+        if scale is None or offset_ns is None:
+            return
+ 
+        anchor = self._observations[0]
+ 
+        self._estimated_scale_ns_per_source_unit = scale
+        self._fit_source_anchor = anchor.source_time
+        self._fit_reference_anchor_ns = anchor.reference_time_ns
+        self._fit_reference_offset_ns = offset_ns
+        self.state = ClockModelState.ALIGNED
+
+    def _calculate_affine_fit(
+        self,
+    ) -> tuple[float | None, float | None]:
+        """Estimate scale and offset with centred ordinary least squares.
+ 
+        The fit is performed on deltas from the first observation:
+ 
+            reference_delta = scale * source_delta + offset
+ 
+        This avoids regressing directly against large absolute timestamps.
+        """
+ 
+        if self.observation_count < 2:
+            return None, None
+ 
+        anchor = self._observations[0]
+ 
+        source_deltas = [
+            float(observation.source_time - anchor.source_time)
+            for observation in self._observations
+        ]
+ 
+        reference_deltas = [
+            float(
+                observation.reference_time_ns
+                - anchor.reference_time_ns
+            )
+            for observation in self._observations
+        ]
+ 
+        mean_source = sum(source_deltas) / len(source_deltas)
+        mean_reference = sum(reference_deltas) / len(reference_deltas)
+ 
+        denominator = sum(
+            (source_delta - mean_source) ** 2
+            for source_delta in source_deltas
+        )
+ 
+        if denominator == 0:
+            return None, None
+ 
+        numerator = sum(
+            (source_delta - mean_source)
+            * (reference_delta - mean_reference)
+            for source_delta, reference_delta in zip(
+                source_deltas,
+                reference_deltas,
+            )
+        )
+ 
+        scale = numerator / denominator
+        offset_ns = mean_reference - scale * mean_source
+ 
+        return scale, offset_ns
