@@ -48,3 +48,4 @@ def test_60hz_unknown_scale_clock_aligns_after_two_seconds() -> None:
         52_000_000_000,
         abs=2,
     )
+

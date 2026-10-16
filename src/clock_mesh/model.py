@@ -1,6 +1,7 @@
 """Affine clock-domain model."""
 
 from __future__ import annotations
+from collections import deque
 
 from .config import ClockAlignmentConfig
 from .types import ClockModelState, ClockObservation, ClockObservation
@@ -22,7 +23,12 @@ class AffineClockModel:
         self.state = ClockModelState.UNOBSERVED
 
         # container to hold observations.
-        self._observations: list[ClockObservation] = []
+        self._observation_count = 0
+
+        self._observations: deque[ClockObservation] = deque(
+            maxlen=self.config.max_calibration_observations,
+        )
+        self._retained_observations: list[ClockObservation] = []
 
         # preserverd for previous tests
         self._anchor_source_time: int | float | None = None
@@ -34,10 +40,52 @@ class AffineClockModel:
         self._fit_reference_anchor_ns: int | None = None
         self._fit_reference_offset_ns: float | None = None
 
+        self._last_prediction_error_ns: int | None = None
+        self._tracking_errors_ns: deque[int] = deque(
+            maxlen=self.config.max_tracking_errors,
+        )
+
+    @property
+    def prediction_error_stddev_ns(self) -> float | None:
+        """Return the standard deviation of retained tracking errors."""
+        if not self._tracking_errors_ns:
+            return None
+
+        mean = self.mean_prediction_error_ns
+        assert mean is not None
+
+        variance = sum(
+            (error - mean) ** 2 for error in self._tracking_errors_ns
+        ) / len(self._tracking_errors_ns)
+
+        return variance**0.5
+    
+    @property
+    def mean_prediction_error_ns(self) -> float | None:
+        """Return the mean signed error over the retained tracking window."""
+        if not self._tracking_errors_ns:
+            return None
+
+        return sum(self._tracking_errors_ns) / len(self._tracking_errors_ns)
+
+    @property
+    def recent_prediction_errors_ns(self) -> tuple[int, ...]:
+        """Return retained tracking errors, oldest to newest."""
+        return tuple(self._tracking_errors_ns)
+
+    @property
+    def retained_observation_count(self) -> int:
+        """Return the number of calibration observations retained."""
+        return len(self._observations)
+    
+    @property
+    def last_prediction_error_ns(self) -> int | None:
+        """Return the prediction error from the most recent observation."""
+        return self._last_prediction_error_ns   
 
     @property
     def observation_count(self) -> int:
-        return len(self._observations)
+        return self._observation_count
 
     @property
     def mapping_available(self) -> bool:
@@ -79,6 +127,25 @@ class AffineClockModel:
     ) -> None:
         """Add one observed correspondence between the two clocks."""
 
+        self._observation_count += 1
+
+        # Tracking evaluates the observation without adding calibration data.
+        if self.state in {
+            ClockModelState.ALIGNED,
+            ClockModelState.TRACKING,
+        }:
+            predicted_reference_ns = self.map(source_time)
+            assert predicted_reference_ns is not None
+
+            self._last_prediction_error_ns = (
+                reference_time_ns - predicted_reference_ns
+            )
+
+            self._tracking_errors_ns.append(self._last_prediction_error_ns)
+
+            self.state = ClockModelState.TRACKING
+            return
+
         self._observations.append(
             ClockObservation(
                 source_time=source_time,
@@ -86,19 +153,14 @@ class AffineClockModel:
             )
         )
 
-        # the first observation sets the anchor point. 
         if self.observation_count == 1:
             self._anchor_source_time = source_time
             self._anchor_reference_time_ns = reference_time_ns
             self.state = ClockModelState.ANCHORED
             return
 
-        # This increment only defines calibration. Once ALIGNED, further
-        # observations are retained but do not yet alter the accepted model.
-
-        if self.state is ClockModelState.ALIGNED:
-            return
-
+        # Existing calibration fit code continues here:
+        scale, _ = self._calculate_affine_fit()
 
         scale, _ = self._calculate_affine_fit()
 
@@ -107,6 +169,7 @@ class AffineClockModel:
             self.state = ClockModelState.RATE_ESTIMATING
 
         # check if enough evidence has been observed to promote the current fit to an applied mapping.
+        # this is where the model transitions from RATE_ESTIMATING to ALIGNED.
         if self._ready_to_align():
             self._accept_learned_mapping()
 
@@ -150,7 +213,10 @@ class AffineClockModel:
     def _ready_to_align(self) -> bool:
         """Return whether enough calibration evidence has been observed."""
 
-        if self.observation_count < self.config.min_learned_observations:
+        if (
+            self.retained_observation_count
+            < self.config.min_learned_observations
+        ):
             return False
 
         first_reference_ns = self._observations[0].reference_time_ns
@@ -187,7 +253,7 @@ class AffineClockModel:
 
         """
 
-        if self.observation_count < 2:
+        if self.retained_observation_count < 2:
             return None, None
 
         anchor = self._observations[0]

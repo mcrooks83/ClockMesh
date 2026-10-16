@@ -14,6 +14,9 @@ class ClockAlignmentConfig:
 
     min_learned_observations: int = 5
 
+    max_calibration_observations: int = 2_048
+    max_tracking_errors: int = 256
+
     # Optional known relationship between one source-clock unit
     # and reference nanoseconds.
     #
