@@ -20,7 +20,6 @@ class AffineClockModel:
 
         # set the initial clock model state and observation count
         self.state = ClockModelState.UNOBSERVED
-        self._observations: list[ClockObservation] = []
 
         # container to hold observations.
         self._observations: list[ClockObservation] = []
@@ -35,14 +34,6 @@ class AffineClockModel:
         self._fit_reference_anchor_ns: int | None = None
         self._fit_reference_offset_ns: float | None = None
 
-    @property
-    def observation_count(self) -> int:
-        """Return the number of observed correspondences."""
-        return len(self._observations)
-
-        self._fit_source_anchor: int | float | None = None
-        self._fit_reference_anchor_ns: int | None = None
-        self._fit_reference_offset_ns: float | None = None
 
     @property
     def observation_count(self) -> int:
