@@ -195,3 +195,131 @@ def test_prediction_error_spread_uses_retained_window() -> None:
     # Only +5 ms and -5 ms remain.
     assert model.mean_prediction_error_ns == pytest.approx(0)
     assert model.prediction_error_stddev_ns == pytest.approx(5_000_000)
+
+def test_tracking_candidate_does_not_change_accepted_mapping() -> None:
+    model = make_aligned_model(
+        config=ClockAlignmentConfig(max_tracking_observations=4)
+    )
+
+    accepted_scale = model.estimated_scale_ns_per_source_unit
+    mapped_before = model.map(40_000_000)
+
+    assert accepted_scale is not None
+    assert mapped_before is not None
+
+    # No candidate exists before tracking observations arrive.
+    assert model.candidate_scale_ns_per_source_unit is None
+
+    assert model.map_candidate(40_000_000) is None
+
+    # Supply four observations following a slightly different relationship:
+    # 1 source unit = 1,001 reference nanoseconds.
+    for index in range(4):
+        model.observe(
+            source_time=35_000_000 + index * 1_000_000,
+            reference_time_ns=(
+                53_000_000_000 + index * 1_001_000_000
+            ),
+        )
+
+    assert model.state is ClockModelState.TRACKING
+    assert model.retained_tracking_observation_count == 4
+
+    assert model.candidate_scale_ns_per_source_unit == pytest.approx(
+        1_001.0,
+        rel=1e-9,
+    )
+
+    # Extrapolate the candidate relationship by five million source units.
+    assert model.map_candidate(40_000_000) == pytest.approx(
+        58_005_000_000,
+        abs=2,
+    )
+
+    # Calculating a candidate must leave the applied mapping unchanged.
+    assert model.estimated_scale_ns_per_source_unit == accepted_scale
+    assert model.map(40_000_000) == mapped_before
+
+def test_tracking_candidate_uses_latest_observations() -> None:
+    model = make_aligned_model(
+        config=ClockAlignmentConfig(max_tracking_observations=3)
+    )
+
+    mapped_before = model.map(40_000_000)
+    assert mapped_before is not None
+
+    # This observation will be evicted from the three-pair window.
+    model.observe(
+        source_time=34_000_000,
+        reference_time_ns=51_500_000_000,
+    )
+
+    # These three retained observations follow a scale of 1,001.
+    for index in range(3):
+        model.observe(
+            source_time=35_000_000 + index * 1_000_000,
+            reference_time_ns=(
+                53_000_000_000 + index * 1_001_000_000
+            ),
+        )
+
+    assert model.retained_tracking_observation_count == 3
+
+    assert model.candidate_scale_ns_per_source_unit == pytest.approx(
+        1_001.0,
+        rel=1e-9,
+    )
+
+    assert model.map(40_000_000) == mapped_before
+
+def test_accept_candidate_changes_scale_without_jump() -> None:
+    model = make_aligned_model(
+        config=ClockAlignmentConfig(
+            max_tracking_observations=8,
+            min_tracking_acceptance_span_ns=3_000_000_000,
+        )
+    )
+
+    # Acceptance is unavailable before tracking.
+    assert model.accept_candidate(34_000_000) is False
+
+    # Two observations are insufficient for acceptance.
+    for index in range(2):
+        model.observe(
+            source_time=35_000_000 + index * 1_000_000,
+            reference_time_ns=(
+                53_000_000_000 + index * 1_001_000_000
+            ),
+        )
+
+    assert model.accept_candidate(36_000_000) is False
+
+    # Complete five observations spanning just over four seconds.
+    for index in range(2, 5):
+        model.observe(
+            source_time=35_000_000 + index * 1_000_000,
+            reference_time_ns=(
+                53_000_000_000 + index * 1_001_000_000
+            ),
+        )
+
+    pivot_source = 39_000_000
+    mapped_before = model.map(pivot_source)
+    assert mapped_before is not None
+
+    # Reject a pivot other than the latest observed source timestamp.
+    assert model.accept_candidate(38_000_000) is False
+
+    assert model.accept_candidate(pivot_source) is True
+
+    assert model.state is ClockModelState.TRACKING
+    assert model.estimated_scale_ns_per_source_unit == pytest.approx(
+        1_001.0,
+        rel=1e-9,
+    )
+
+    # No jump at acceptance.
+    assert model.map(pivot_source) == mapped_before
+
+    # Subsequent timestamps use the newly accepted scale.
+    assert model.map(40_000_000) == mapped_before + 1_001_000_000

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from collections import deque
+import math
 
 from .config import ClockAlignmentConfig
 from .types import ClockModelState, ClockObservation, ClockObservation
@@ -44,6 +45,23 @@ class AffineClockModel:
         self._tracking_errors_ns: deque[int] = deque(
             maxlen=self.config.max_tracking_errors,
         )
+
+        self._tracking_observations: deque[ClockObservation] = deque(
+            maxlen=self.config.max_tracking_observations,
+        )
+
+        self._candidate_scale_ns_per_source_unit: float | None = None
+        self._candidate_reference_offset_ns: float | None = None
+
+    @property
+    def retained_tracking_observation_count(self) -> int:
+        """Return the number of timestamp pairs retained for tracking."""
+        return len(self._tracking_observations)
+
+    @property
+    def candidate_scale_ns_per_source_unit(self) -> float | None:
+        """Return the latest tracking fit's scale."""
+        return self._candidate_scale_ns_per_source_unit
 
     @property
     def prediction_error_stddev_ns(self) -> float | None:
@@ -134,14 +152,28 @@ class AffineClockModel:
             ClockModelState.ALIGNED,
             ClockModelState.TRACKING,
         }:
+            # Evaluate against the accepted mapping before calculating a candidate.
             predicted_reference_ns = self.map(source_time)
             assert predicted_reference_ns is not None
 
             self._last_prediction_error_ns = (
                 reference_time_ns - predicted_reference_ns
             )
-
             self._tracking_errors_ns.append(self._last_prediction_error_ns)
+
+            self._tracking_observations.append(
+                ClockObservation(
+                    source_time=source_time,
+                    reference_time_ns=reference_time_ns,
+                )
+            )
+
+            scale, offset_ns = self._calculate_affine_fit(
+                self._tracking_observations
+            )
+
+            self._candidate_scale_ns_per_source_unit = scale
+            self._candidate_reference_offset_ns = offset_ns
 
             self.state = ClockModelState.TRACKING
             return
@@ -160,9 +192,7 @@ class AffineClockModel:
             return
 
         # Existing calibration fit code continues here:
-        scale, _ = self._calculate_affine_fit()
-
-        scale, _ = self._calculate_affine_fit()
+        scale, _ = self._calculate_affine_fit(self._observations)
 
         if scale is not None:
             self._estimated_scale_ns_per_source_unit = scale
@@ -172,6 +202,25 @@ class AffineClockModel:
         # this is where the model transitions from RATE_ESTIMATING to ALIGNED.
         if self._ready_to_align():
             self._accept_learned_mapping()
+
+    def map_candidate(self, source_time: int | float) -> int | None:
+        """Map using the latest candidate fit without accepting it."""
+        if (
+            not self._tracking_observations
+            or self._candidate_scale_ns_per_source_unit is None
+            or self._candidate_reference_offset_ns is None
+        ):
+            return None
+
+        anchor = self._tracking_observations[0]
+        source_delta = source_time - anchor.source_time
+
+        mapped_delta_ns = (
+            self._candidate_reference_offset_ns
+            + source_delta * self._candidate_scale_ns_per_source_unit
+        )
+
+        return anchor.reference_time_ns + round(mapped_delta_ns)
 
     def map(self, source_time: int | float) -> int | None:
         """Map a source timestamp onto the reference clock."""
@@ -225,11 +274,54 @@ class AffineClockModel:
 
         return reference_span_ns >= self.config.target_calibration_span_ns
 
+    def accept_candidate(self, source_time: int | float) -> bool:
+        """Apply the candidate scale while preserving mapping at source_time."""
+        if self.state is not ClockModelState.TRACKING:
+            return False
+
+        if (
+            len(self._tracking_observations)
+            < self.config.min_learned_observations
+        ):
+            return False
+
+        first = self._tracking_observations[0]
+        latest = self._tracking_observations[-1]
+
+        reference_span_ns = (
+            latest.reference_time_ns - first.reference_time_ns
+        )
+
+        if (
+            reference_span_ns
+            < self.config.min_tracking_acceptance_span_ns
+        ):
+            return False
+
+        scale = self._candidate_scale_ns_per_source_unit
+        if scale is None or not math.isfinite(scale) or scale <= 0:
+            return False
+
+        # Accept only at the latest observed source timestamp.
+        if source_time != latest.source_time:
+            return False
+
+        mapped_time_ns = self.map(source_time)
+        if mapped_time_ns is None:
+            return False
+
+        # Preserve the current mapped time and change the slope from here.
+        self._fit_source_anchor = source_time
+        self._fit_reference_anchor_ns = mapped_time_ns
+        self._fit_reference_offset_ns = 0.0
+        self._estimated_scale_ns_per_source_unit = scale
+
+        return True
 
     def _accept_learned_mapping(self) -> None:
         """Promote the current affine estimate to an applied mapping."""
 
-        scale, offset_ns = self._calculate_affine_fit()
+        scale, offset_ns = self._calculate_affine_fit(self._observations)
         if scale is None or offset_ns is None:
             return
 
@@ -240,27 +332,22 @@ class AffineClockModel:
         self._fit_reference_offset_ns = offset_ns
         self.state = ClockModelState.ALIGNED
  
+    @staticmethod
     def _calculate_affine_fit(
-        self,
+        observations: list[ClockObservation] | deque[ClockObservation],
     ) -> tuple[float | None, float | None]:
-        """Estimate scale and offset with centred ordinary least squares.
+        """Fit reference deltas against source deltas.
 
-        The fit is performed on deltas from the first observation:
-
-            reference_delta = scale * source_delta + offset
-
-        This avoids regressing directly against large absolute timestamps.
-
+        The returned offset is relative to the first supplied observation.
         """
-
-        if self.retained_observation_count < 2:
+        if len(observations) < 2:
             return None, None
 
-        anchor = self._observations[0]
+        anchor = observations[0]
 
         source_deltas = [
             float(observation.source_time - anchor.source_time)
-            for observation in self._observations
+            for observation in observations
         ]
 
         reference_deltas = [
@@ -268,7 +355,7 @@ class AffineClockModel:
                 observation.reference_time_ns
                 - anchor.reference_time_ns
             )
-            for observation in self._observations
+            for observation in observations
         ]
 
 
