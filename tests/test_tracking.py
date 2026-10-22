@@ -323,3 +323,43 @@ def test_accept_candidate_changes_scale_without_jump() -> None:
 
     # Subsequent timestamps use the newly accepted scale.
     assert model.map(40_000_000) == mapped_before + 1_001_000_000
+
+def test_full_candidate_applies_offset_and_scale_then_scale_updates_are_continuous():
+    model = make_aligned_model(ClockAlignmentConfig(
+        min_tracking_acceptance_span_ns=3_000_000_000))
+    # Distinct slope and intercept relative to the initial calibration.
+    for index in range(5):
+        source = 35_000_000 + index * 1_000_000
+        model.observe(source, 53_005_000_000 + index * 1_001_000_000)
+    before = model.map(source)
+    full = model.map_candidate(source)
+    assert full != before
+    assert model.candidate_is_eligible(source)
+    assert not model.accept_full_candidate(source - 1)
+    assert model.map(source) == before
+    assert model.accept_full_candidate(source)
+    assert model.map(source) == full
+    assert model.estimated_scale_ns_per_source_unit == pytest.approx(1001)
+    assert model.map(source + 1_000_000) == full + 1_001_000_000
+    # A later candidate has a different offset and rate. Continuous acceptance
+    # still preserves the current mapped pivot instead of applying that offset.
+    for index in range(5):
+        source = 40_000_000 + index * 1_000_000
+        model.observe(source, 58_020_000_000 + index * 1_002_000_000)
+    before = model.map(source)
+    assert model.map_candidate(source) != before
+    assert model.accept_candidate(source)
+    assert model.map(source) == before
+
+
+def test_full_candidate_reuses_count_and_span_eligibility():
+    model = make_aligned_model(ClockAlignmentConfig(
+        min_tracking_acceptance_span_ns=5_000_000_000))
+    assert not model.accept_full_candidate(34_000_000)
+    for index in range(6):
+        source = 35_000_000 + index * 1_000_000
+        model.observe(source, 53_000_000_000 + index * 1_000_000_000)
+        before = model.map(source)
+        assert model.candidate_is_eligible(source) == (index == 5)
+        assert model.accept_full_candidate(source) == (index == 5)
+        assert model.map(source) == before
